@@ -86,6 +86,17 @@ class RayChangeDetector {
     float presence_confidence = 0.5f;
   } const config;
 
+  // ray_change_detector.h
+  struct Stats {
+    std::atomic<uint64_t> num_calls{0};
+    std::atomic<uint64_t> num_observations{0};  // present + absent per call.
+    std::atomic<uint64_t> num_time_bins{0};     // time_series.size(), the actual map size.
+    std::atomic<uint64_t> num_window_lookups{0};  // T x W hash probes.
+    void reset() { /* store(0) x4 */ }
+  };
+  mutable Stats stats_;
+
+
   // Construction.
   explicit RayChangeDetector(const Config& config);
   virtual ~RayChangeDetector() = default;

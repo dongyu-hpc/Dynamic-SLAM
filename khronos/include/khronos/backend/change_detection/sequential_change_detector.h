@@ -111,7 +111,16 @@ class SequentialChangeDetector {
 
   // Current change detection state for icnremental updates.
   Changes changes_;
+
+  
 };
+
+ private:
+  // Instrumentation.
+  size_t num_detect_calls_ = 0;
+  // Structure histograms are appended here when non-empty. Set from the pipeline/config.
+  std::string rv_hist_csv_;
+
 
 void declare_config(SequentialChangeDetector::Config& config);
 

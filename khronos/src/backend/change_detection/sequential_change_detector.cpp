@@ -35,7 +35,9 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  * -------------------------------------------------------------------------- */
 
+
 #include "khronos/backend/change_detection/sequential_change_detector.h"
+#include <cstdlib>
 
 namespace khronos {
 
@@ -66,6 +68,12 @@ SequentialChangeDetector::SequentialChangeDetector(const Config& config)
   if (!background_change_detector_) {
     background_change_detector_ = std::make_unique<BackgroundChangeDetector>();
   }
+  
+  // Instrumentation output path. Set KHRONOS_RV_HIST_CSV to enable histogram dumping.
+  if (const char* path = std::getenv("KHRONOS_RV_HIST_CSV")) {
+    rv_hist_csv_ = path;
+    LOG(INFO) << "[CD] Writing ray verificator histograms to '" << rv_hist_csv_ << "'.";
+  }
 }
 
 void SequentialChangeDetector::setDsg(std::shared_ptr<const DynamicSceneGraph> dsg) {
@@ -74,10 +82,18 @@ void SequentialChangeDetector::setDsg(std::shared_ptr<const DynamicSceneGraph> d
 }
 
 const Changes& SequentialChangeDetector::detectChanges(const RPGOMerges& rpgo_merges,
-                                                       TimeStamp stamp,
-                                                       bool had_loopclosure) {
+                                                      TimeStamp stamp,
+                                                      bool had_loopclosure) {
   const std::string timer_suffix = had_loopclosure ? "_recompute" : "_incremental";
   Timer timer("change_detection" + timer_suffix + "/all", stamp);
+
+  // Label the ray verificator's internal timers with the same stamp as the backend.
+  ray_verificator_->setTimerStamp(stamp);
+  ++num_detect_calls_;
+
+  // Tag used for the instrumentation log lines. Keeps recompute and incremental spins separable,
+  // since a loop closure rebuilds the hash and re-queries every change from scratch.
+  const std::string mode = had_loopclosure ? "recompute" : "incremental";
 
   // Setup the ray verificator.
   Timer detail_timer("change_detection" + timer_suffix + "/update_ray_verificator", stamp);
@@ -92,11 +108,25 @@ const Changes& SequentialChangeDetector::detectChanges(const RPGOMerges& rpgo_me
 
   // Perform object-level change detection.
   detail_timer.reset("change_detection" + timer_suffix + "/objects");
+  ray_verificator_->resetStats();
   object_change_detector_->detectChanges(*dsg_, rpgo_merges, changes_.object_changes);
+  ray_verificator_->logQueryStats(mode + "/objects");
 
   // Perform background-level change detection.
   detail_timer.reset("change_detection" + timer_suffix + "/background");
+  ray_verificator_->resetStats();
   background_change_detector_->detectChanges(*dsg_, changes_.background_changes);
+  ray_verificator_->logQueryStats(mode + "/background");
+
+  // Periodically dump the full rays-per-block histogram. O(num_blocks), so not every spin.
+  if (!rv_hist_csv_.empty() && (had_loopclosure || num_detect_calls_ % 10 == 0)) {
+    ray_verificator_->logStructureStats(mode + "/periodic", rv_hist_csv_);
+  }
+
+  LOG(INFO) << "[CD/" << mode << "] call=" << num_detect_calls_
+            << " stamp=" << stamp
+            << " object_changes=" << changes_.object_changes.size()
+            << " background_changes=" << changes_.background_changes.size();
 
   return changes_;
 }

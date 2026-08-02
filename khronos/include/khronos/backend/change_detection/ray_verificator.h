@@ -37,8 +37,10 @@
 
 #pragma once
 
+#include <atomic>
 #include <limits>
 #include <memory>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -64,6 +66,54 @@ class RayVerificator {
   using ConstPtr = std::shared_ptr<const RayVerificator>;
   using IndexSet = std::unordered_set<size_t>;
   using SpatialHash = BlockIndexMap<IndexSet>;
+
+  /**
+   * @brief Query-side instrumentation counters. Accumulated across all check() calls until
+   * resetStats() is called. Atomic so that check() stays safe to call from multiple threads.
+   *
+   * The two ratios that matter for downstream design:
+   *   num_examined / num_candidates -> waste of the post-fetch temporal filter.
+   *   num_no_overlap / num_examined -> early-exit rate of the radial test.
+   */
+  struct Stats {
+    std::atomic<uint64_t> num_checks{0};       // Total check() calls.
+    std::atomic<uint64_t> num_no_rays{0};      // Returned early: no rays at all.
+    std::atomic<uint64_t> num_empty_block{0};  // Returned early: point's block has no rays.
+    std::atomic<uint64_t> num_candidates{0};   // Rays in block, before temporal filtering.
+    std::atomic<uint64_t> num_examined{0};     // Rays surviving temporal filtering.
+    std::atomic<uint64_t> num_no_overlap{0};   // Failed the radial tolerance test.
+    std::atomic<uint64_t> num_occluded{0};
+    std::atomic<uint64_t> num_absent{0};
+    std::atomic<uint64_t> num_match{0};
+
+    void reset() {
+      num_checks.store(0, std::memory_order_relaxed);
+      num_no_rays.store(0, std::memory_order_relaxed);
+      num_empty_block.store(0, std::memory_order_relaxed);
+      num_candidates.store(0, std::memory_order_relaxed);
+      num_examined.store(0, std::memory_order_relaxed);
+      num_no_overlap.store(0, std::memory_order_relaxed);
+      num_occluded.store(0, std::memory_order_relaxed);
+      num_absent.store(0, std::memory_order_relaxed);
+      num_match.store(0, std::memory_order_relaxed);
+    }
+  };
+
+  /**
+   * @brief Build-side counters describing the work done by the most recent updateDsg() call.
+   * Single-threaded, so plain integers.
+   */
+  struct UpdateStats {
+    size_t total_vertices = 0;         // Mesh vertices after the update.
+    size_t new_vertices = 0;           // Vertices added by this update.
+    size_t stamps_touched = 0;         // Stamps copied and offset (full-array cost).
+    size_t new_rays = 0;               // Rays created by this update.
+    size_t march_steps = 0;            // Hash insertions from ray marching in this update.
+    size_t reobserved_vertices = 0;
+    size_t reobserved_objects = 0;
+
+    void reset() { *this = UpdateStats(); }
+  };
 
   // Config.
   struct Config {
@@ -146,6 +196,10 @@ class RayVerificator {
    */
   void setDsg(std::shared_ptr<const DynamicSceneGraph> dsg);
 
+  /// Set the timestamp used to label the internal scoped timers.
+  void setTimerStamp(uint64_t stamp) { timer_stamp_ = stamp; }
+
+
   /**
    * @brief Incrementally add new measurements of a single growing dynamic scene graph to the ray
    * verificator. This assumes that the initially set DSG only adds new poses and vertices. Past
@@ -171,6 +225,25 @@ class RayVerificator {
    * @brief Get the set of objects that were re-observed during the last update.
    */
   const IndexSet& getReobservedObjects() const { return reobserved_objects_; }
+
+  // Instrumentation accessors.
+  const Stats& getStats() const { return stats_; }
+  void resetStats() const { stats_.reset(); }
+  const UpdateStats& getUpdateStats() const { return update_stats_; }
+  size_t getNumRays() const { return rays_.size(); }
+  size_t getNumRecomputeHashCalls() const { return num_recompute_hash_calls_; }
+
+  /**
+   * @brief Log the size, occupancy and estimated memory footprint of the spatial hashes.
+   * @param tag Label written into the log line, e.g. "post_update".
+   * @param csv_path If non-empty, the full rays-per-block histogram is appended to this file.
+   */
+  void logStructureStats(const std::string& tag, const std::string& csv_path = "") const;
+
+  /**
+   * @brief Log the accumulated query-side counters and the derived ratios.
+   */
+  void logQueryStats(const std::string& tag) const;
 
  private:
   struct Ray {
@@ -206,6 +279,15 @@ class RayVerificator {
   // Cached data.
   std::shared_ptr<const DynamicSceneGraph> dsg_;
   unsigned int seed_;
+
+  // Instrumentation. Mutable since check() is const.
+  mutable Stats stats_;
+  UpdateStats update_stats_;
+  size_t num_recompute_hash_calls_ = 0;
+  // Timestamp handed to the Hydra scoped timers for the current update.
+  uint64_t timer_stamp_ = 0;
+  // Accumulator written by addRayToHash(), harvested per update.
+  size_t march_steps_accum_ = 0;
 
   // Variables.
   // The index of the last incrementally added measurement to add all new indices.
