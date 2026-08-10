@@ -1,4 +1,0 @@
-# New time mode to set.
-uint8 time_mode # 0: robot, 1: query, 2: online
----
-uint8 resulting_time_mode
