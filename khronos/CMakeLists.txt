@@ -64,7 +64,6 @@ target_include_directories(
         ${OpenCV_INCLUDE_DIRS}
         ${kimera_pgmo_INCLUDE_DIRS}
         ${hydra_INCLUDE_DIRS}
-        PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${tf2_eigen_INCLUE_DIRS}
 )
 target_link_libraries(
 ${PROJECT_NAME}
@@ -75,7 +74,6 @@ ${PROJECT_NAME}
         spatial_hash::spatial_hash
         ${kimera_pgmo_LIBRARIES}
         ${hydra_LIBRARIES}
-        PRIVATE ${tf2_eigen_LIBRARIES}
 )
 set_property(TARGET ${PROJECT_NAME} PROPERTY POSITION_INDEPENDENT_CODE ON)
 add_library(khronos::${PROJECT_NAME} ALIAS ${PROJECT_NAME})

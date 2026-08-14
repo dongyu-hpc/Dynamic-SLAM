@@ -38,49 +38,9 @@
 #include "khronos/backend/change_detection/ray_verificator.h"
 
 #include <stdlib.h>
-
-#include <algorithm>
-#include <fstream>
-#include <string>
-
 #include <glog/logging.h>
-#include <hydra/utils/timing_utilities.h>
 
 namespace khronos {
-namespace {
-
-// Single place to adapt if the Hydra timing API differs in your checkout.
-#define KHRONOS_RV_TIMER(var, name, stamp) Timer var(name, stamp)
-
-
-// Rough libstdc++ footprint model for BlockIndexMap<unordered_set<size_t>>.
-// Per set element: list node (16 B header + 8 B value, malloc-rounded to 32 B) + bucket slot 8 B.
-constexpr double kBytesPerSetElement = 40.0;
-// Per map entry: node header + BlockIndex key + the unordered_set object itself + bucket slot.
-constexpr double kBytesPerMapEntry = 96.0;
-
-// Packed CSR equivalent: uint32 index per entry plus one uint64 row offset per block.
-constexpr double kCsrBytesPerEntry = 4.0;
-constexpr double kCsrBytesPerRow = 8.0;
-
-double estimateHashBytes(size_t num_entries, size_t num_blocks) {
-  return num_entries * kBytesPerSetElement + num_blocks * kBytesPerMapEntry;
-}
-
-double estimateCsrBytes(size_t num_entries, size_t num_blocks) {
-  return num_entries * kCsrBytesPerEntry + num_blocks * kCsrBytesPerRow;
-}
-
-size_t percentile(const std::vector<size_t>& sorted, double p) {
-  if (sorted.empty()) {
-    return 0;
-  }
-  const size_t last = sorted.size() - 1;
-  const size_t k = std::min(last, static_cast<size_t>(p * static_cast<double>(last)));
-  return sorted[k];
-}
-
-}  // namespace
 
 void declare_config(RayVerificator::Config& config) {
   using namespace config;
@@ -109,18 +69,7 @@ RayVerificator::CheckResult RayVerificator::check(const Point& point,
                                                   CheckDetails* details) const {
   CheckResult result;
 
-  // Local counters. check() is called once per query point (potentially millions of times per
-  // spin), so all accumulation happens in registers and is flushed once on exit.
-  uint64_t n_examined = 0;
-  uint64_t n_no_overlap = 0;
-  uint64_t n_occluded = 0;
-  uint64_t n_absent = 0;
-  uint64_t n_match = 0;
-
-  stats_.num_checks.fetch_add(1, std::memory_order_relaxed);
-
   if (rays_.empty()) {
-    stats_.num_no_rays.fetch_add(1, std::memory_order_relaxed);
     CLOG(6) << "Point unobserved: no measurements.";
     return result;
   }
@@ -128,13 +77,9 @@ RayVerificator::CheckResult RayVerificator::check(const Point& point,
   // Lookup all candidate views that could have observed the point.
   const auto it = block_seen_by_rays_.find(grid_.toIndex(point));
   if (it == block_seen_by_rays_.end()) {
-    stats_.num_empty_block.fetch_add(1, std::memory_order_relaxed);
     CLOG(6) << "Point unobserved: no measurements_.";
     return result;
   }
-
-  // Denominator for the temporal-filter waste ratio: everything we are about to touch.
-  stats_.num_candidates.fetch_add(it->second.size(), std::memory_order_relaxed);
 
   // TODO(lschmid): This is a bit inefficient, we could cache the lookup.
   const RayLookup lookup(*dsg_, config);
@@ -146,7 +91,6 @@ RayVerificator::CheckResult RayVerificator::check(const Point& point,
       // This measurement is out of the temporal range to check.
       continue;
     }
-    ++n_examined;
 
     const Point source = lookup.getSource(ray);
     const Point direction = (point - source).normalized();
@@ -162,7 +106,6 @@ RayVerificator::CheckResult RayVerificator::check(const Point& point,
     }
     if (radial_distance > config.radial_tolerance) {
       // No overlap on the ray.
-      ++n_no_overlap;
       if (details) {
         details->range.emplace_back(0.f);
         details->result.emplace_back(CheckDetails::Result::kNoOverlap);
@@ -176,7 +119,6 @@ RayVerificator::CheckResult RayVerificator::check(const Point& point,
     }
     if (depth - depth_distance > config.depth_tolerance) {
       // This is an occlusion, the point has not been observed.
-      ++n_occluded;
       if (details) {
         details->result.emplace_back(CheckDetails::Result::kOccludded);
       }
@@ -186,7 +128,6 @@ RayVerificator::CheckResult RayVerificator::check(const Point& point,
     if (depth_distance - depth > config.depth_tolerance) {
       // This is a ray through our point, so it's evidence of absence.
       result.absent.emplace_back(ray.timestamp);
-      ++n_absent;
       if (details) {
         details->result.emplace_back(CheckDetails::Result::kAbsent);
       }
@@ -195,25 +136,15 @@ RayVerificator::CheckResult RayVerificator::check(const Point& point,
 
     // This means the point is within the tolerance, it's a match.
     result.present.emplace_back(ray.timestamp);
-    ++n_match;
     if (details) {
       details->result.emplace_back(CheckDetails::Result::kMatch);
     }
   }
 
-  // Flush once per call.
-  stats_.num_examined.fetch_add(n_examined, std::memory_order_relaxed);
-  stats_.num_no_overlap.fetch_add(n_no_overlap, std::memory_order_relaxed);
-  stats_.num_occluded.fetch_add(n_occluded, std::memory_order_relaxed);
-  stats_.num_absent.fetch_add(n_absent, std::memory_order_relaxed);
-  stats_.num_match.fetch_add(n_match, std::memory_order_relaxed);
-
   return result;
 }
 
 void RayVerificator::setDsg(std::shared_ptr<const DynamicSceneGraph> dsg) {
-  KHRONOS_RV_TIMER(timer, "rv/set_dsg", timer_stamp_);
-
   // Clear the current state and add DSG data from the start.
   dsg_ = std::move(dsg);
   rays_.clear();
@@ -225,75 +156,29 @@ void RayVerificator::setDsg(std::shared_ptr<const DynamicSceneGraph> dsg) {
   previous_node_id_ = 0;
   previous_vertex_index_ = 0;
   previous_object_index_ = 0;
-
-  update_stats_.reset();
-  march_steps_accum_ = 0;
-
   addPoseNodes();
-  timer_stamp_ = timestamps_.empty() ? 0 : timestamps_.back();
   addVertices();
-
-  update_stats_.march_steps = march_steps_accum_;
-  logStructureStats("post_set_dsg");
 }
 
 void RayVerificator::updateDsg() {
-  KHRONOS_RV_TIMER(timer_total, "rv/update_total", timer_stamp_);
+  // Add only the new parts to the measurements and hash.
+  addPoseNodes();
+  BlockIndexSet observed_blocks = addVertices();
+  addObjectsToHash();
 
-  update_stats_.reset();
-  march_steps_accum_ = 0;
-
-  {
-    KHRONOS_RV_TIMER(timer, "rv/update/add_pose_nodes", timer_stamp_);
-    addPoseNodes();
-  }
-
-  // Stamp the remaining timers with the newest agent timestamp so that the Hydra timing CSV lines
-  // up with the rest of the backend.
-  timer_stamp_ = timestamps_.empty() ? 0 : timestamps_.back();
-
-  BlockIndexSet observed_blocks;
-  {
-    KHRONOS_RV_TIMER(timer, "rv/update/add_vertices", timer_stamp_);
-    observed_blocks = addVertices();
-  }
-  {
-    KHRONOS_RV_TIMER(timer, "rv/update/add_objects", timer_stamp_);
-    addObjectsToHash();
-  }
-
-  {
-    KHRONOS_RV_TIMER(timer, "rv/update/reobserved", timer_stamp_);
-    // Compute the newly re-observed vertices and objects.
-    reobserved_vertices_.clear();
-    reobserved_objects_.clear();
-    for (const auto& index : observed_blocks) {
-      const auto it = vertices_in_block_.find(index);
-      if (it != vertices_in_block_.end()) {
-        reobserved_vertices_.insert(it->second.begin(), it->second.end());
-      }
-      const auto it2 = objects_in_block_.find(index);
-      if (it2 != objects_in_block_.end()) {
-        reobserved_objects_.insert(it2->second.begin(), it2->second.end());
-      }
+  // Compute the newly re-observed vertices and objects.
+  reobserved_vertices_.clear();
+  reobserved_objects_.clear();
+  for (const auto& index : observed_blocks) {
+    const auto it = vertices_in_block_.find(index);
+    if (it != vertices_in_block_.end()) {
+      reobserved_vertices_.insert(it->second.begin(), it->second.end());
+    }
+    const auto it2 = objects_in_block_.find(index);
+    if (it2 != objects_in_block_.end()) {
+      reobserved_objects_.insert(it2->second.begin(), it2->second.end());
     }
   }
-
-  update_stats_.march_steps = march_steps_accum_;
-  update_stats_.reobserved_vertices = reobserved_vertices_.size();
-  update_stats_.reobserved_objects = reobserved_objects_.size();
-
-  LOG(INFO) << "[RV/update] total_vertices=" << update_stats_.total_vertices
-            << " new_vertices=" << update_stats_.new_vertices
-            << " stamps_touched=" << update_stats_.stamps_touched
-            << " new_rays=" << update_stats_.new_rays
-            << " total_rays=" << rays_.size()
-            << " march_steps=" << update_stats_.march_steps
-            << " observed_blocks=" << observed_blocks.size()
-            << " reobs_vertices=" << update_stats_.reobserved_vertices
-            << " reobs_objects=" << update_stats_.reobserved_objects;
-
-  logStructureStats("post_update");
 }
 
 void RayVerificator::addPoseNodes() {
@@ -334,64 +219,43 @@ BlockIndexSet RayVerificator::addVertices() {
   // For all vertices, compute the sources they belong to and add them to the library of rays.
   const auto& vertices = dsg_->mesh()->points;
   const auto& first_seen = dsg_->mesh()->first_seen_stamps;
-
-  // --- Segment (a): full-array stamp copy and offset. -----------------------------------------
-  // NOTE(instrumentation): both the copy and the offset loop are O(total vertices) even though
-  // only the range [previous_vertex_index_, size) is consumed below. 'stamps_touched' quantifies
-  // the redundant work; compare it against 'new_vertices'.
-  std::decay_t<decltype(dsg_->mesh()->stamps)> last_seen;
-  {
-    KHRONOS_RV_TIMER(timer, "rv/add_vertices/stamps_copy", timer_stamp_);
-    last_seen = dsg_->mesh()->stamps;
-
-    // Ensure all mesh arrays have consistent sizes
-    if (vertices.size() != first_seen.size() || vertices.size() != last_seen.size()) {
-      LOG(WARNING) << "Mesh arrays have inconsistent sizes: vertices=" << vertices.size()
-                   << ", first_seen=" << first_seen.size()
-                   << ", last_seen=" << last_seen.size();
-      return observed_blocks;
+  auto last_seen = dsg_->mesh()->stamps;
+  
+  // Ensure all mesh arrays have consistent sizes
+  if (vertices.size() != first_seen.size() || vertices.size() != last_seen.size()) {
+    LOG(WARNING) << "Mesh arrays have inconsistent sizes: vertices=" << vertices.size() 
+                 << ", first_seen=" << first_seen.size() 
+                 << ", last_seen=" << last_seen.size();
+    return observed_blocks;
+  }
+  if (config.active_window_duration > 0) {
+    const uint64_t offset_ns = config.active_window_duration * 1e9;
+    for (auto& stamp : last_seen) {
+      stamp -= offset_ns;
     }
-    if (config.active_window_duration > 0) {
-      const uint64_t offset_ns = config.active_window_duration * 1e9;
-      for (auto& stamp : last_seen) {
-        stamp -= offset_ns;
-      }
-    }
-    update_stats_.stamps_touched = last_seen.size();
   }
 
-  update_stats_.total_vertices = vertices.size();
-  update_stats_.new_vertices =
-      vertices.size() > previous_vertex_index_ ? vertices.size() - previous_vertex_index_ : 0;
+  for (size_t i = previous_vertex_index_; i < vertices.size(); ++i) {
+    // Add the vertex to the hash.
+    vertices_in_block_[grid_.toIndex(vertices.at(i))].insert(i);
 
-  // --- Segment (b): per-new-vertex ray construction and hashing. ------------------------------
-  {
-    KHRONOS_RV_TIMER(timer, "rv/add_vertices/vertex_loop", timer_stamp_);
-    size_t new_rays = 0;
-    for (size_t i = previous_vertex_index_; i < vertices.size(); ++i) {
-      // Add the vertex to the hash.
-      vertices_in_block_[grid_.toIndex(vertices.at(i))].insert(i);
+    // Compute which measurements this vertex belongs to.
+    const auto source_indices = computeVertexSources(first_seen.at(i), last_seen.at(i));
+    if (source_indices.empty()) {
+      continue;
+    }
 
-      // Compute which measurements this vertex belongs to.
-      const auto source_indices = computeVertexSources(first_seen.at(i), last_seen.at(i));
-      if (source_indices.empty()) {
+    // Create the rays and add them to the hash.
+    for (const size_t source_index : source_indices) {
+      if (source_index >= timestamps_.size() || source_index >= node_ids_.size()) {
+        LOG(WARNING) << "Invalid source index: " << source_index 
+                     << " (timestamps size=" << timestamps_.size() 
+                     << ", node_ids size=" << node_ids_.size() << ")";
         continue;
       }
-
-      // Create the rays and add them to the hash.
-      for (const size_t source_index : source_indices) {
-        if (source_index >= timestamps_.size() || source_index >= node_ids_.size()) {
-          LOG(WARNING) << "Invalid source index: " << source_index
-                       << " (timestamps size=" << timestamps_.size()
-                       << ", node_ids size=" << node_ids_.size() << ")";
-          continue;
-        }
-        rays_.emplace_back(timestamps_.at(source_index), node_ids_.at(source_index), i);
-        ++new_rays;
-        observed_blocks.merge(addRayToHash(rays_.size() - 1));
-      }
+      rays_.emplace_back(timestamps_.at(source_index), node_ids_.at(source_index), i);
+      observed_blocks.merge(addRayToHash(rays_.size() - 1));
     }
-    update_stats_.new_rays = new_rays;
   }
   previous_vertex_index_ = vertices.size();
 
@@ -450,10 +314,6 @@ std::unordered_set<size_t> RayVerificator::computeVertexSources(const size_t fir
 }
 
 void RayVerificator::recomputeHash() {
-  KHRONOS_RV_TIMER(timer, "rv/recompute_hash", timer_stamp_);
-  ++num_recompute_hash_calls_;
-  const size_t march_before = march_steps_accum_;
-
   // Populate the block hash for lookup of poses, vertices, and objects later.
   block_seen_by_rays_.clear();
   vertices_in_block_.clear();
@@ -462,11 +322,6 @@ void RayVerificator::recomputeHash() {
     addRayToHash(i);
   }
   addObjectsToHash();
-
-  LOG(INFO) << "[RV/recompute_hash] call=" << num_recompute_hash_calls_
-            << " rays=" << rays_.size()
-            << " march_steps=" << (march_steps_accum_ - march_before);
-  logStructureStats("post_recompute_hash");
 }
 
 BlockIndexSet RayVerificator::addRayToHash(const size_t ray_index) {
@@ -480,7 +335,6 @@ BlockIndexSet RayVerificator::addRayToHash(const size_t ray_index) {
   const float max_depth = (target - source).norm();
   const float ray_step = config.block_size / 4;
   float ray_distance = 0.f;
-  size_t local_steps = 0;
 
   // NOTE(lschmid): This ray marching may miss some corner case blocks but that's fine, this is a
   // preliminary implementation.
@@ -490,11 +344,7 @@ BlockIndexSet RayVerificator::addRayToHash(const size_t ray_index) {
     const BlockIndex index = grid_.toIndex(ray_point);
     block_seen_by_rays_[index].insert(ray_index);
     observed_blocks.insert(index);
-    ++local_steps;
   }
-
-  // Accumulated locally, added once, so the inner loop stays free of shared writes.
-  march_steps_accum_ += local_steps;
   return observed_blocks;
 }
 
@@ -521,107 +371,6 @@ void RayVerificator::addObjectsToHash() {
       objects_in_block_[index].insert(id);
     }
   }
-}
-
-void RayVerificator::logStructureStats(const std::string& tag,
-                                       const std::string& csv_path) const {
-  // Rays per block: the load-imbalance distribution that drives any batched implementation.
-  std::vector<size_t> rays_per_block;
-  rays_per_block.reserve(block_seen_by_rays_.size());
-  size_t ray_entries = 0;
-  for (const auto& [index, ray_set] : block_seen_by_rays_) {
-    ray_entries += ray_set.size();
-    rays_per_block.push_back(ray_set.size());
-  }
-  std::sort(rays_per_block.begin(), rays_per_block.end());
-
-  size_t vertex_entries = 0;
-  for (const auto& [index, vertex_set] : vertices_in_block_) {
-    vertex_entries += vertex_set.size();
-  }
-  size_t object_entries = 0;
-  for (const auto& [index, object_set] : objects_in_block_) {
-    object_entries += object_set.size();
-  }
-
-  const double ray_hash_mb =
-      estimateHashBytes(ray_entries, block_seen_by_rays_.size()) / 1e6;
-  const double vertex_hash_mb =
-      estimateHashBytes(vertex_entries, vertices_in_block_.size()) / 1e6;
-  const double object_hash_mb =
-      estimateHashBytes(object_entries, objects_in_block_.size()) / 1e6;
-  const double ray_csr_mb = estimateCsrBytes(ray_entries, block_seen_by_rays_.size()) / 1e6;
-
-  const size_t num_vertices =
-      (dsg_ && dsg_->hasMesh()) ? dsg_->mesh()->numVertices() : 0;
-  const double mean_rays_per_block =
-      block_seen_by_rays_.empty()
-          ? 0.0
-          : static_cast<double>(ray_entries) / static_cast<double>(block_seen_by_rays_.size());
-
-  LOG(INFO) << "[RV/" << tag << "] vertices=" << num_vertices
-            << " rays=" << rays_.size()
-            << " poses=" << timestamps_.size()
-            << " ray_blocks=" << block_seen_by_rays_.size()
-            << " ray_entries=" << ray_entries
-            << " vertex_entries=" << vertex_entries
-            << " object_entries=" << object_entries
-            << " rays_per_block(mean=" << mean_rays_per_block
-            << ", p50=" << percentile(rays_per_block, 0.50)
-            << ", p90=" << percentile(rays_per_block, 0.90)
-            << ", p99=" << percentile(rays_per_block, 0.99)
-            << ", max=" << (rays_per_block.empty() ? 0 : rays_per_block.back()) << ")"
-            << " est_MB(ray_hash=" << ray_hash_mb
-            << ", vertex_hash=" << vertex_hash_mb
-            << ", object_hash=" << object_hash_mb
-            << ", ray_csr=" << ray_csr_mb
-            << ", hash/csr=" << (ray_csr_mb > 0.0 ? ray_hash_mb / ray_csr_mb : 0.0) << ")";
-
-  if (csv_path.empty()) {
-    return;
-  }
-
-  // Append the full histogram so the distribution can be replotted offline.
-  std::ofstream out(csv_path, std::ios::app);
-  if (!out.is_open()) {
-    LOG(WARNING) << "Could not open '" << csv_path << "' to write ray verificator histogram.";
-    return;
-  }
-  out << "# tag=" << tag << " stamp=" << timer_stamp_ << " rays=" << rays_.size()
-      << " blocks=" << block_seen_by_rays_.size() << "\n";
-  for (size_t i = 0; i < rays_per_block.size(); ++i) {
-    out << rays_per_block[i] << (i + 1 == rays_per_block.size() ? '\n' : ',');
-  }
-}
-
-void RayVerificator::logQueryStats(const std::string& tag) const {
-  const uint64_t checks = stats_.num_checks.load(std::memory_order_relaxed);
-  const uint64_t no_rays = stats_.num_no_rays.load(std::memory_order_relaxed);
-  const uint64_t empty_block = stats_.num_empty_block.load(std::memory_order_relaxed);
-  const uint64_t candidates = stats_.num_candidates.load(std::memory_order_relaxed);
-  const uint64_t examined = stats_.num_examined.load(std::memory_order_relaxed);
-  const uint64_t no_overlap = stats_.num_no_overlap.load(std::memory_order_relaxed);
-  const uint64_t occluded = stats_.num_occluded.load(std::memory_order_relaxed);
-  const uint64_t absent = stats_.num_absent.load(std::memory_order_relaxed);
-  const uint64_t match = stats_.num_match.load(std::memory_order_relaxed);
-
-  const auto ratio = [](uint64_t num, uint64_t den) {
-    return den == 0 ? 0.0 : static_cast<double>(num) / static_cast<double>(den);
-  };
-
-  LOG(INFO) << "[RV/query/" << tag << "] checks=" << checks
-            << " no_rays=" << no_rays
-            << " empty_block=" << empty_block
-            << " candidates=" << candidates
-            << " examined=" << examined
-            << " no_overlap=" << no_overlap
-            << " occluded=" << occluded
-            << " absent=" << absent
-            << " match=" << match
-            << " | candidates/check=" << ratio(candidates, checks)
-            << " temporal_keep=" << ratio(examined, candidates)
-            << " radial_reject=" << ratio(no_overlap, examined)
-            << " decisive=" << ratio(absent + match, examined);
 }
 
 }  // namespace khronos
