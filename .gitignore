@@ -68,3 +68,6 @@ CATKIN_IGNORE
 Notes.txt
 *compile_commands.json
 *.clangd
+
+# dataset
+data
