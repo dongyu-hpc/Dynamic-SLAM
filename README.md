@@ -1,3 +1,5 @@
+后续整理更严格的命令行。
+
 1. 原始Khronos运行方式请切换到ROS2分支，查看原版README.
 
 2. main分支作为clean version，仅保留了算法核心逻辑，用于进行方法部分的开发，使用cmake && make方法。适合于进行纯数学与几何计算的数值实验。实际部署运行请将变动更新到ros2并构建ros2 workspace进行部署，使用colcon进行编译和安装。main中删除掉的有：evaluation、visualization、ros2.
